@@ -1,75 +1,10 @@
-from typing import List, Optional, Tuple
+from typing import List, Tuple, Dict
 
 import cv2
 import numpy as np
 import pyclipper
+from numpy import ndarray
 from shapely.geometry import Polygon
-
-
-class DetPreProcess:
-    def __init__(self, limit_side_len: int = 736, limit_type: str = "min"):
-        self.mean = np.array([0.5, 0.5, 0.5])
-        self.std = np.array([0.5, 0.5, 0.5])
-        self.scale = 1 / 255.0
-
-        self.limit_side_len = limit_side_len
-        self.limit_type = limit_type
-
-    def __call__(self, img: np.ndarray) -> Optional[np.ndarray]:
-        resized_img = self.resize(img)
-        if resized_img is None:
-            return None
-
-        img = self.normalize(resized_img)
-        img = self.permute(img)
-        img = np.expand_dims(img, axis=0).astype(np.float32)
-        return img
-
-    def normalize(self, img: np.ndarray) -> np.ndarray:
-        return (img.astype("float32") * self.scale - self.mean) / self.std
-
-    def permute(self, img: np.ndarray) -> np.ndarray:
-        return img.transpose((2, 0, 1))
-
-    def resize(self, img: np.ndarray) -> Optional[np.ndarray]:
-        """resize image to a size multiple of 32 which is required by the network"""
-        h, w = img.shape[:2]
-
-        if self.limit_type == "max":
-            if max(h, w) > self.limit_side_len:
-                if h > w:
-                    ratio = float(self.limit_side_len) / h
-                else:
-                    ratio = float(self.limit_side_len) / w
-            else:
-                ratio = 1.0
-        else:
-            if min(h, w) < self.limit_side_len:
-                if h < w:
-                    ratio = float(self.limit_side_len) / h
-                else:
-                    ratio = float(self.limit_side_len) / w
-            else:
-                ratio = 1.0
-
-        resize_h = int(h * ratio)
-        resize_w = int(w * ratio)
-
-        resize_h = int(round(resize_h / 32) * 32)
-        resize_w = int(round(resize_w / 32) * 32)
-
-        try:
-            if int(resize_w) <= 0 or int(resize_h) <= 0:
-                return None
-            img = cv2.resize(img, (int(resize_w), int(resize_h)))
-        except Exception as exc:
-            raise ResizeImgError from exc
-
-        return img
-
-
-class ResizeImgError(Exception):
-    pass
 
 
 class DBPostProcess:
@@ -92,27 +27,27 @@ class DBPostProcess:
         self.score_mode = score_mode
 
         self.dilation_kernel = None
-        if use_dilation:
-            self.dilation_kernel = np.array([[1, 1], [1, 1]])
 
-    def __call__(
-        self, pred: np.ndarray, ori_shape: Tuple[int, int]
-    ) -> Tuple[np.ndarray, List[float]]:
-        src_h, src_w = ori_shape
+        self.dilation_kernel = None if not use_dilation else np.array([[1, 1], [1, 1]])
+
+    def __call__(self, outs_dict: Dict, shape_list: Tuple[int, int]) -> List[Dict[str, ndarray]]:
+        pred = outs_dict["maps"]
         pred = pred[:, 0, :, :]
         segmentation = pred > self.thresh
 
-        mask = segmentation[0]
-        if self.dilation_kernel is not None:
-            mask = cv2.dilate(
-                np.array(segmentation[0]).astype(np.uint8), self.dilation_kernel
-            )
-        boxes, scores = self.boxes_from_bitmap(pred[0], mask, src_w, src_h)
-        return boxes, scores
+        boxes_batch = []
+        for batch_index in range(pred.shape[0]):
+            src_h, src_w, ratio_h, ratio_w = shape_list[batch_index]
+            if self.dilation_kernel is not None:
+                mask = cv2.dilate(np.array(segmentation[batch_index]).astype(np.uint8), self.dilation_kernel)
+            else:
+                mask = segmentation[batch_index]
+            boxes, scores = self.boxes_from_bitmap(pred[batch_index], mask, src_w, src_h)
 
-    def boxes_from_bitmap(
-        self, pred: np.ndarray, bitmap: np.ndarray, dest_width: int, dest_height: int
-    ) -> Tuple[np.ndarray, List[float]]:
+            boxes_batch.append({"points": boxes})
+        return boxes_batch
+
+    def boxes_from_bitmap(self, pred: np.ndarray, bitmap: np.ndarray, dest_width: int, dest_height: int) -> Tuple[np.ndarray, List[float]]:
         """
         bitmap: single map with shape (1, H, W),
                 whose values are binarized as {0, 1}
@@ -120,9 +55,7 @@ class DBPostProcess:
 
         height, width = bitmap.shape
 
-        outs = cv2.findContours(
-            (bitmap * 255).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-        )
+        outs = cv2.findContours((bitmap * 255).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         if len(outs) == 3:
             img, contours, _ = outs[0], outs[1], outs[2]
         elif len(outs) == 2:
@@ -151,14 +84,13 @@ class DBPostProcess:
                 continue
 
             box[:, 0] = np.clip(np.round(box[:, 0] / width * dest_width), 0, dest_width)
-            box[:, 1] = np.clip(
-                np.round(box[:, 1] / height * dest_height), 0, dest_height
-            )
+            box[:, 1] = np.clip(np.round(box[:, 1] / height * dest_height), 0, dest_height)
             boxes.append(box.astype(np.int32))
             scores.append(score)
         return np.array(boxes, dtype=np.int32), scores
 
-    def get_mini_boxes(self, contour: np.ndarray) -> Tuple[np.ndarray, float]:
+    @staticmethod
+    def get_mini_boxes(contour: np.ndarray) -> Tuple[np.ndarray, float]:
         bounding_box = cv2.minAreaRect(contour)
         points = sorted(list(cv2.boxPoints(bounding_box)), key=lambda x: x[0])
 
@@ -177,13 +109,14 @@ class DBPostProcess:
             index_2 = 3
             index_3 = 2
 
-        box = np.array(
-            [points[index_1], points[index_2], points[index_3], points[index_4]]
-        )
+        box = np.array([points[index_1], points[index_2], points[index_3], points[index_4]])
         return box, min(bounding_box[1])
 
     @staticmethod
     def box_score_fast(bitmap: np.ndarray, _box: np.ndarray) -> float:
+        """
+        box_score_fast: use bbox mean score as the mean score
+        """
         h, w = bitmap.shape[:2]
         box = _box.copy()
         xmin = np.clip(np.floor(box[:, 0].min()).astype(np.int32), 0, w - 1)
@@ -197,8 +130,11 @@ class DBPostProcess:
         cv2.fillPoly(mask, box.reshape(1, -1, 2).astype(np.int32), 1)
         return cv2.mean(bitmap[ymin : ymax + 1, xmin : xmax + 1], mask)[0]
 
-    def box_score_slow(self, bitmap: np.ndarray, contour: np.ndarray) -> float:
-        """use polyon mean score as the mean score"""
+    @staticmethod
+    def box_score_slow(bitmap: np.ndarray, contour: np.ndarray) -> float:
+        """
+        box_score_slow: use polyon mean score as the mean score
+        """
         h, w = bitmap.shape[:2]
         contour = contour.copy()
         contour = np.reshape(contour, (-1, 2))

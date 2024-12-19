@@ -11,35 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import argparse
 import copy
 import math
 import time
-from typing import Any, Dict, List, Tuple, Union
+from typing import List, Tuple, Union
 
 import cv2
 import numpy as np
-from utils import OrtInferSession, read_yaml
 
+import utility
 from .postprocess import ClsPostProcess
 
 
 class TextClassifier:
-    def __init__(self, config: Dict[str, Any]):
-        self.cls_image_shape = config["cls_image_shape"]
-        self.cls_batch_num = config["cls_batch_num"]
-        self.cls_thresh = config["cls_thresh"]
-        self.postprocess_op = ClsPostProcess(config["label_list"])
+    def __init__(self, args):
+        self.cls_image_shape = args.cls_image_shape
+        self.cls_batch_num = args.cls_batch_num
+        self.cls_thresh = args.cls_thresh
 
-        self.infer = OrtInferSession(config)
+        self.postprocess_op = ClsPostProcess(args.label_list)
+        self.predictor, self.input_tensor, self.output_tensors, _ = utility.create_predictor(args, args.cls_model_path)
 
-    def __call__(
-        self, img_list: Union[np.ndarray, List[np.ndarray]]
-    ) -> Tuple[List[np.ndarray], List[List[Union[str, float]]], float]:
+    def __call__(self, img_list: Union[np.ndarray, List[np.ndarray]]) -> Tuple[List[np.ndarray], List[List[Union[str, float]]], float]:
         if isinstance(img_list, np.ndarray):
             img_list = [img_list]
 
         img_list = copy.deepcopy(img_list)
+        img_num = len(img_list)
 
         # Calculate the aspect ratio of all text bars
         width_list = [img.shape[1] / float(img.shape[0]) for img in img_list]
@@ -47,7 +45,6 @@ class TextClassifier:
         # Sorting can speed up the cls process
         indices = np.argsort(np.array(width_list))
 
-        img_num = len(img_list)
         cls_res = [["", 0.0]] * img_num
         batch_num = self.cls_batch_num
         elapse = 0
@@ -55,23 +52,29 @@ class TextClassifier:
             end_img_no = min(img_num, beg_img_no + batch_num)
 
             norm_img_batch = []
+            max_wh_ratio = 0
+            start_time = time.time()
+            for ino in range(beg_img_no, end_img_no):
+                h, w = img_list[indices[ino]].shape[0:2]
+                wh_ratio = w * 1.0 / h
+                max_wh_ratio = max(max_wh_ratio, wh_ratio)
             for ino in range(beg_img_no, end_img_no):
                 norm_img = self.resize_norm_img(img_list[indices[ino]])
                 norm_img = norm_img[np.newaxis, :]
                 norm_img_batch.append(norm_img)
-            norm_img_batch = np.concatenate(norm_img_batch).astype(np.float32)
+            norm_img_batch = np.concatenate(norm_img_batch)
+            norm_img_batch = norm_img_batch.copy()
 
-            starttime = time.time()
-            prob_out = self.infer(norm_img_batch)[0]
+            input_dict = {self.input_tensor.name: norm_img_batch}
+            outputs = self.predictor.run(self.output_tensors, input_dict)
+            prob_out = outputs[0]
             cls_result = self.postprocess_op(prob_out)
-            elapse += time.time() - starttime
+            elapse += time.time() - start_time
 
             for rno, (label, score) in enumerate(cls_result):
                 cls_res[indices[beg_img_no + rno]] = [label, score]
                 if "180" in label and score > self.cls_thresh:
-                    img_list[indices[beg_img_no + rno]] = cv2.rotate(
-                        img_list[indices[beg_img_no + rno]], 1
-                    )
+                    img_list[indices[beg_img_no + rno]] = cv2.rotate(img_list[indices[beg_img_no + rno]], 1)
         return img_list, cls_res, elapse
 
     def resize_norm_img(self, img: np.ndarray) -> np.ndarray:
@@ -96,19 +99,3 @@ class TextClassifier:
         padding_im = np.zeros((img_c, img_h, img_w), dtype=np.float32)
         padding_im[:, :, :resized_w] = resized_image
         return padding_im
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--image_path", type=str, help="image_dir|image_path")
-    parser.add_argument("--config_path", type=str, default="config.yaml")
-    args = parser.parse_args()
-
-    config = read_yaml(args.config_path)
-
-    text_classifier = TextClassifier(config)
-
-    img = cv2.imread(args.image_path)
-    img_list, cls_res, predict_time = text_classifier(img)
-    for ino in range(len(img_list)):
-        print(f"cls result:{cls_res[ino]}")

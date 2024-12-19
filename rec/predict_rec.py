@@ -11,39 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import argparse
 import math
 import time
-from typing import Any, Dict, List, Tuple, Union
+from typing import List, Tuple, Union
 
 import cv2
 import numpy as np
 
-from utils import OrtInferSession, read_yaml
-
+import utility
 from .postprocess import CTCLabelDecode
 
 
 class TextRecognizer:
-    def __init__(self, config: Dict[str, Any]):
-        self.session = OrtInferSession(config)
+    def __init__(self, args):
+        self.rec_batch_num = args.rec_batch_num
+        self.rec_image_shape = args.rec_image_shape
 
-        character = None
-        if self.session.have_key():
-            character = self.session.get_character_list()
+        self.predictor, self.input_tensor, self.output_tensors, _ = utility.create_predictor(args, args.rec_model_path)
 
-        character_path = config.get("rec_keys_path", None)
-        self.postprocess_op = CTCLabelDecode(
-            character=character, character_path=character_path
-        )
-
-        self.rec_batch_num = config["rec_batch_num"]
-        self.rec_image_shape = config["rec_img_shape"]
+        self.postprocess_op = CTCLabelDecode(character_dict_path=args.character_dict_path, use_space_char=True)
+        self.return_word_box = args.return_word_box
 
     def __call__(
-        self,
-        img_list: Union[np.ndarray, List[np.ndarray]],
-        return_word_box: bool = False,
+        self, img_list: Union[np.ndarray, List[np.ndarray]], return_word_box: bool = False
     ) -> Tuple[List[Tuple[str, float]], float]:
         if isinstance(img_list, np.ndarray):
             img_list = [img_list]
@@ -58,7 +48,8 @@ class TextRecognizer:
         rec_res = [("", 0.0)] * img_num
 
         batch_num = self.rec_batch_num
-        elapse = 0
+
+        start_time = time.time()
         for beg_img_no in range(0, img_num, batch_num):
             end_img_no = min(img_num, beg_img_no + batch_num)
 
@@ -76,20 +67,23 @@ class TextRecognizer:
             for ino in range(beg_img_no, end_img_no):
                 norm_img = self.resize_norm_img(img_list[indices[ino]], max_wh_ratio)
                 norm_img_batch.append(norm_img[np.newaxis, :])
-            norm_img_batch = np.concatenate(norm_img_batch).astype(np.float32)
+            norm_img_batch = np.concatenate(norm_img_batch)
+            norm_img_batch = norm_img_batch.copy()
 
-            starttime = time.time()
-            preds = self.session(norm_img_batch)[0]
+            input_dict = {self.input_tensor.name: norm_img_batch}
+            outputs = self.predictor.run(self.output_tensors, input_dict)
+            preds = outputs[0]
+
             rec_result = self.postprocess_op(
                 preds,
-                return_word_box,
+                return_word_box=self.return_word_box,
                 wh_ratio_list=wh_ratio_list,
                 max_wh_ratio=max_wh_ratio,
             )
 
             for rno, one_res in enumerate(rec_result):
                 rec_res[indices[beg_img_no + rno]] = one_res
-            elapse += time.time() - starttime
+        elapse = time.time() - start_time
         return rec_res, elapse
 
     def resize_norm_img(self, img: np.ndarray, max_wh_ratio: float) -> np.ndarray:
@@ -114,17 +108,3 @@ class TextRecognizer:
         padding_im = np.zeros((img_channel, img_height, img_width), dtype=np.float32)
         padding_im[:, :, 0:resized_w] = resized_image
         return padding_im
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--image_path", type=str, help="image_dir|image_path")
-    parser.add_argument("--config_path", type=str, default="config.yaml")
-    args = parser.parse_args()
-
-    config = read_yaml(args.config_path)
-    text_recognizer = TextRecognizer(config)
-
-    img = cv2.imread(args.image_path)
-    rec_res, predict_time = text_recognizer(img)
-    print(f"rec result: {rec_res}\t cost: {predict_time}s")

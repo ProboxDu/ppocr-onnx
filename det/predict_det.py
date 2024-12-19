@@ -12,65 +12,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
-from utils import OrtInferSession
-
-from .postprocess import DBPostProcess, DetPreProcess
+import utility
+from .postprocess import DBPostProcess
+from .preprocess import create_operators, transform
 
 
 class TextDetector:
-    def __init__(self, config: Dict[str, Any]):
-        self.limit_type = config.get("limit_type", "min")
-        self.limit_side_len = config.get("limit_side_len", 736)
-        self.preprocess_op = None
+    def __init__(self, args):
+        pre_process_list = [
+            {
+                "DetResizeForTest": {
+                    "limit_side_len": args.det_limit_side_len,
+                    "limit_type": args.det_limit_type,
+                }
+            },
+            {
+                "NormalizeImage": {
+                    "std": [0.229, 0.224, 0.225],
+                    "mean": [0.485, 0.456, 0.406],
+                    "scale": "1./255.",
+                    "order": "hwc",
+                }
+            },
+            {"ToCHWImage": None},
+            {"KeepKeys": {"keep_keys": ["image", "shape"]}},
+        ]
+        self.preprocess_op = create_operators(pre_process_list)
 
         post_process = {
-            "thresh": config.get("thresh", 0.3),
-            "box_thresh": config.get("box_thresh", 0.5),
-            "max_candidates": config.get("max_candidates", 1000),
-            "unclip_ratio": config.get("unclip_ratio", 1.6),
-            "use_dilation": config.get("use_dilation", True),
-            "score_mode": config.get("score_mode", "fast"),
+            "thresh": args.det_db_thresh,
+            "box_thresh": args.det_db_box_thresh,
+            "max_candidates": args.det_db_max_candidates,
+            "unclip_ratio": args.det_db_unclip_ratio,
+            "use_dilation": args.use_dilation,
+            "score_mode": args.det_db_score_mode,
         }
         self.postprocess_op = DBPostProcess(**post_process)
 
-        self.infer = OrtInferSession(config)
+        self.predictor, self.input_tensor, self.output_tensors, _ = utility.create_predictor(args, args.det_model_path)
 
     def __call__(self, img: np.ndarray) -> Tuple[Optional[np.ndarray], float]:
-        start_time = time.perf_counter()
-
-        if img is None:
-            raise ValueError("img is None")
-
         ori_img_shape = img.shape[0], img.shape[1]
-        self.preprocess_op = self.get_preprocess(max(img.shape[0], img.shape[1]))
-        prepro_img = self.preprocess_op(img)
-        if prepro_img is None:
+        data = {"image": img}
+        data = transform(data, self.preprocess_op)
+        img, shape_list = data
+        if img is None:
             return None, 0
 
-        preds = self.infer(prepro_img)[0]
-        dt_boxes, dt_boxes_scores = self.postprocess_op(preds, ori_img_shape)
+        img = np.expand_dims(img, axis=0)
+        shape_list = np.expand_dims(shape_list, axis=0)
+        img = img.copy()
+        start_time = time.time()
+
+        input_dict = {self.input_tensor.name: img}
+
+        outputs = self.predictor.run(self.output_tensors, input_dict)
+
+        preds = {"maps": outputs[0]}
+        post_result = self.postprocess_op(preds, shape_list)
+        dt_boxes = post_result[0]["points"]
         dt_boxes = self.filter_tag_det_res(dt_boxes, ori_img_shape)
-        elapse = time.perf_counter() - start_time
+        elapse = time.time() - start_time
         return dt_boxes, elapse
 
-    def get_preprocess(self, max_wh):
-        if self.limit_type == 'min':
-            limit_side_len = self.limit_side_len
-        elif max_wh < 960:
-            limit_side_len = 960
-        elif max_wh < 1500:
-            limit_side_len = 1500
-        else:
-            limit_side_len = 2000
-        return DetPreProcess(limit_side_len, self.limit_type)
-
-    def filter_tag_det_res(
-        self, dt_boxes: np.ndarray, image_shape: Tuple[int, int]
-    ) -> np.ndarray:
+    def filter_tag_det_res(self, dt_boxes: np.ndarray, image_shape: Tuple[int, int]) -> np.ndarray:
         img_height, img_width = image_shape
         dt_boxes_new = []
         for box in dt_boxes:
@@ -85,16 +94,16 @@ class TextDetector:
             dt_boxes_new.append(box)
         return np.array(dt_boxes_new)
 
-    def order_points_clockwise(self, pts: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def order_points_clockwise(pts: np.ndarray) -> np.ndarray:
         """
-        reference from:
-        https://github.com/jrosebr1/imutils/blob/master/imutils/perspective.py
+        reference from: https://github.com/jrosebr1/imutils/blob/master/imutils/perspective.py
         sort the points based on their x-coordinates
         """
         xSorted = pts[np.argsort(pts[:, 0]), :]
 
         # grab the left-most and right-most points from the sorted
-        # x-roodinate points
+        # x-coordinate points
         leftMost = xSorted[:2, :]
         rightMost = xSorted[2:, :]
 
@@ -110,9 +119,8 @@ class TextDetector:
         rect = np.array([tl, tr, br, bl], dtype="float32")
         return rect
 
-    def clip_det_res(
-        self, points: np.ndarray, img_height: int, img_width: int
-    ) -> np.ndarray:
+    @staticmethod
+    def clip_det_res(points: np.ndarray, img_height: int, img_width: int) -> np.ndarray:
         for pno in range(points.shape[0]):
             points[pno, 0] = int(min(max(points[pno, 0], 0), img_width - 1))
             points[pno, 1] = int(min(max(points[pno, 1], 0), img_height - 1))
