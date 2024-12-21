@@ -1,0 +1,5 @@
+onnxruntime-gpu
+opencv-python
+pillow
+pyclipper
+shapely 

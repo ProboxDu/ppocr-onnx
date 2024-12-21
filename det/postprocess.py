@@ -30,7 +30,7 @@ class DBPostProcess:
 
         self.dilation_kernel = None if not use_dilation else np.array([[1, 1], [1, 1]])
 
-    def __call__(self, outs_dict: Dict, shape_list: Tuple[int, int]) -> List[Dict[str, ndarray]]:
+    def __call__(self, outs_dict: Dict[str, ndarray], shape_list: List[Tuple[int, int, float, float]]) -> List[Dict[str, ndarray]]:
         pred = outs_dict["maps"]
         pred = pred[:, 0, :, :]
         segmentation = pred > self.thresh
