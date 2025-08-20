@@ -8,7 +8,7 @@ from predict_system import TextSystem
 
 
 def main():
-    ocr = TextSystem(args)
+    ocr = TextSystem(args = utility.parse_args())
     img = cv2.imread("test.png")
 
     img = cv2.resize(img, (0, 0), fx=1.5, fy=1.5, interpolation=cv2.INTER_LINEAR)
@@ -20,5 +20,5 @@ def main():
 
 if __name__ == "__main__":
     logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
-    args = utility.parse_args()
+    
     main()
